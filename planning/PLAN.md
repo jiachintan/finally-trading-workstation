@@ -66,7 +66,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 - **Backend**: FastAPI (Python), managed as a `uv` project
 - **Database**: SQLite, single file at `db/finally.db`, volume-mounted for persistence
 - **Real-time data**: Server-Sent Events (SSE) — simpler than WebSockets, one-way server→client push, works everywhere
-- **AI integration**: LiteLLM → OpenRouter (Cerebras for fast inference), with structured outputs for trade execution
+- **AI integration**: Anthropic Claude API (`claude-sonnet-4-6`), with structured outputs for trade execution
 - **Market data**: Environment-variable driven — simulator by default, real data via Massive API if key provided
 
 ### Why These Choices
@@ -121,8 +121,8 @@ finally/
 ## 5. Environment Variables
 
 ```bash
-# Required: OpenRouter API key for LLM chat functionality
-OPENROUTER_API_KEY=your-openrouter-api-key-here
+# Required: Anthropic Claude API key for LLM chat functionality
+ANTHROPIC_API_KEY=your_key_here
 
 # Optional: Massive (Polygon.io) API key for real market data
 # If not set, the built-in market simulator is used (recommended for most users)
@@ -175,8 +175,9 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
-- Each SSE event contains ticker, price, previous price, timestamp, and change direction
+- Server pushes price updates for all tickers in the watchlist at a regular cadence (~500ms)
+- When the user adds a new ticker to the watchlist, the backend adds it to the price cache immediately; it will appear in the SSE stream within the next update cycle (no restart required)
+- Each SSE event contains: `ticker`, `price`, `previous_price`, `timestamp`, `change_direction` (`"up"` or `"down"`)
 - Client handles reconnection automatically (EventSource has built-in retry)
 
 ---
@@ -193,50 +194,43 @@ The backend checks for the SQLite database on startup (or first request). If the
 
 ### Schema
 
-All tables include a `user_id` column defaulting to `"default"`. This is hardcoded for now (single-user) but enables future multi-user support without schema migration.
+This is a single-user application. No `user_id` columns are used — each table holds exactly one user's data.
 
-**users_profile** — User state (cash balance)
-- `id` TEXT PRIMARY KEY (default: `"default"`)
+**users_profile** — User state (cash balance). Single row, always `id = "default"`.
+- `id` TEXT PRIMARY KEY (`"default"`)
 - `cash_balance` REAL (default: `10000.0`)
 - `created_at` TEXT (ISO timestamp)
 
 **watchlist** — Tickers the user is watching
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
-- `ticker` TEXT
+- `ticker` TEXT UNIQUE
 - `added_at` TEXT (ISO timestamp)
-- UNIQUE constraint on `(user_id, ticker)`
 
-**positions** — Current holdings (one row per ticker per user)
+**positions** — Current holdings (one row per ticker)
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
-- `ticker` TEXT
+- `ticker` TEXT UNIQUE
 - `quantity` REAL (fractional shares supported)
 - `avg_cost` REAL
 - `updated_at` TEXT (ISO timestamp)
-- UNIQUE constraint on `(user_id, ticker)`
 
 **trades** — Trade history (append-only log)
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
 - `side` TEXT (`"buy"` or `"sell"`)
 - `quantity` REAL (fractional shares supported)
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded at backend startup (ensuring at least one data point exists) and immediately after each trade execution. No background polling task.
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
 - `total_value` REAL
 - `recorded_at` TEXT (ISO timestamp)
 
 **chat_messages** — Conversation history with LLM
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
 - `role` TEXT (`"user"` or `"assistant"`)
 - `content` TEXT
-- `actions` TEXT (JSON — trades executed, watchlist changes made; null for user messages)
+- `actions` TEXT (JSON — only the successfully executed trades and watchlist changes; null for user messages and assistant messages with no actions)
 - `created_at` TEXT (ISO timestamp)
 
 ### Default Seed Data
@@ -281,9 +275,9 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 ## 9. LLM Integration
 
-When writing code to make calls to LLMs, use cerebras-inference skill to use LiteLLM via OpenRouter to the `openrouter/openai/gpt-oss-120b` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
+When writing code to make calls to LLMs, use the Anthropic Claude API directly with the `claude-sonnet-4-6` model. Use Structured Outputs so that you can interpret the results reliably.
 
-There is an OPENROUTER_API_KEY in the .env file in the project root.
+There is an ANTHROPIC_API_KEY in the .env file in the project root.
 
 ### How It Works
 
@@ -292,11 +286,11 @@ When the user sends a chat message, the backend:
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
 2. Loads recent conversation history from the `chat_messages` table
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
-4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
+4. Calls the Anthropic Claude API (`claude-sonnet-4-6`), requesting structured output
 5. Parses the complete structured JSON response
 6. Auto-executes any trades or watchlist changes specified in the response
 7. Stores the message and executed actions in `chat_messages`
-8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
+8. Returns the complete JSON response to the frontend (no token-by-token streaming — a loading indicator is sufficient)
 
 ### Structured Output Schema
 
@@ -309,14 +303,15 @@ The LLM is instructed to respond with JSON matching this schema:
     {"ticker": "AAPL", "side": "buy", "quantity": 10}
   ],
   "watchlist_changes": [
-    {"ticker": "PYPL", "action": "add"}
+    {"ticker": "PYPL", "action": "add"},
+    {"ticker": "NFLX", "action": "remove"}
   ]
 }
 ```
 
 - `message` (required): The conversational text shown to the user
-- `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells)
-- `watchlist_changes` (optional): Array of watchlist modifications
+- `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells). `side` must be `"buy"` or `"sell"`.
+- `watchlist_changes` (optional): Array of watchlist modifications. `action` must be `"add"` or `"remove"`.
 
 ### Auto-Execution
 
@@ -339,10 +334,15 @@ The LLM should be prompted as "FinAlly, an AI trading assistant" with instructio
 
 ### LLM Mock Mode
 
-When `LLM_MOCK=true`, the backend returns deterministic mock responses instead of calling OpenRouter. This enables:
-- Fast, free, reproducible E2E tests
-- Development without an API key
-- CI/CD pipelines
+When `LLM_MOCK=true`, the backend returns the following deterministic mock response instead of calling the Anthropic API. This enables fast, free, reproducible E2E tests and development without an API key.
+
+```json
+{
+  "message": "I've reviewed your portfolio. You have a solid mix of tech and financial holdings. Consider diversifying further — your portfolio is currently tech-heavy. Want me to suggest some trades?",
+  "trades": [],
+  "watchlist_changes": []
+}
+```
 
 ---
 
@@ -352,8 +352,8 @@ When `LLM_MOCK=true`, the backend returns deterministic mock responses instead o
 
 The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements:
 
-- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
-- **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
+- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), % change since session start (frontend computes this from the first price seen per ticker since page load vs current price), and a sparkline mini-chart (accumulated from SSE since page load)
+- **Main chart area** — larger price-over-time chart for the selected ticker, built entirely from SSE data accumulated since page load. The chart is empty on first load and fills in progressively. Clicking a ticker in the watchlist selects it here.
 - **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
@@ -364,7 +364,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 ### Technical Notes
 
 - Use `EventSource` for SSE connection to `/api/stream/prices`
-- Canvas-based charting library preferred (Lightweight Charts or Recharts) for performance
+- Use **Lightweight Charts** (by TradingView) for all charts — better suited for financial time-series than Recharts, lower bundle size, canvas-based for performance
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
 - All API calls go to the same origin (`/api/*`) — no CORS configuration needed
 - Tailwind CSS for styling with a custom dark theme
@@ -378,7 +378,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 ```
 Stage 1: Node 20 slim
   - Copy frontend/
-  - npm install && npm run build (produces static export)
+  - npm ci && npm run build (produces static export)
 
 Stage 2: Python 3.12 slim
   - Install uv
@@ -442,7 +442,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 ### E2E Tests (in `test/`)
 
-**Infrastructure**: A separate `docker-compose.test.yml` in `test/` that spins up the app container plus a Playwright container. This keeps browser dependencies out of the production image.
+**Infrastructure**: Playwright tests run directly against a locally-started container (no separate Playwright container or `docker-compose.test.yml`). The test runner starts the app with `LLM_MOCK=true` and runs Playwright against `http://localhost:8000`.
 
 **Environment**: Tests run with `LLM_MOCK=true` by default for speed and determinism.
 
@@ -454,3 +454,4 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
